@@ -26,19 +26,39 @@ an odd `--rows` is rounded down.
 
 ## Setup
 
-Python 3.8+ and `fontTools` — already present in Anaconda and most Python
-installs.
+Python 3.8 or newer, plus two packages:
 
 ```sh
+pip install -r requirements.txt
 ./handwriting_practice.py --fetch-fonts     # once: downloads the school cursive fonts
-pip install uharfbuzz                       # once: makes cursive letters join up
 ```
 
-Neither step is strictly required — the program runs on the macOS system fonts
-alone — but both matter if you want proper joined-up cursive. School cursive
-faces build their joins from separate connector glyphs that only appear when the
-text is shaped, and `uharfbuzz` is what does the shaping. Without it those fonts
-print as disconnected letters, and the program warns you.
+`fonttools` is required — it reads the fonts and embeds them. `uharfbuzz` is
+listed as well and you want it: school cursive faces build their joins from
+separate connector glyphs that only appear when the text is shaped, and
+`uharfbuzz` is what does the shaping. Without it those fonts print as
+disconnected letters, and the program warns you. Everything else is standard
+library — the PDF is written directly, with no PDF library involved.
+
+### On another machine
+
+```sh
+pip install -r requirements.txt
+./handwriting_practice.py --fetch-fonts
+./handwriting_practice.py --font kid "Hello world"
+```
+
+Two things to know when you move off this Mac:
+
+- **Pass a `kid*` font.** Those live in `fonts/` and work anywhere. The other
+  presets (`cursive`, `print`, `chalk`, …) are macOS system fonts and will not
+  exist elsewhere — including `cursive`, which is the default, so a bare run
+  with no `--font` will stop and tell you to check `--list-fonts`.
+- **`--fetch-fonts` needs the network once.** After that `fonts/` is
+  self-contained; copy the folder along with the scripts and it works offline.
+
+`--list-fonts` marks with a ✓ whatever is actually usable on the machine you
+are on.
 
 ## Use
 

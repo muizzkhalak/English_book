@@ -1,0 +1,17 @@
+# Dependencies for handwriting_practice.py and handwriting_alternating.py
+#
+#   pip install -r requirements.txt
+#
+# Python 3.8 or newer. Everything else these scripts use is in the standard
+# library - the PDF is written directly, with no PDF library involved.
+
+# Reads the handwriting fonts, measures them against the ruling, subsets them
+# and embeds them in the PDF. Required.
+fonttools>=4.20.0
+
+# Shapes the text, so school-cursive faces join their letters properly. These
+# fonts build their joins from separate connector glyphs that only appear when
+# the text is shaped. Strictly optional - the scripts still run without it, but
+# the joined-cursive presets (kid, kid-modern, kid-uk, kid-simple) then print as
+# disconnected letters, and you get a warning saying so.
+uharfbuzz>=0.30.0

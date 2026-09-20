@@ -34,11 +34,39 @@ import zlib
 
 logging.getLogger("fontTools").setLevel(logging.ERROR)
 
+try:                                    # optional: proper cursive joining
+    import uharfbuzz as hb
+except ImportError:
+    hb = None
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(HERE, "fonts")
+
 _SUP = "/System/Library/Fonts/Supplemental"
 _SYS = "/System/Library/Fonts"
 _LIN = "/usr/share/fonts/truetype"
 
+def _bundled(name: str) -> str:
+    return os.path.join(FONT_DIR, name)
+
+
+# Open-licensed school-handwriting faces fetched by --fetch-fonts.
+# All SIL Open Font License; see fonts/README.md once downloaded.
+GOOGLE_FONTS: dict[str, tuple[str, str]] = {
+    "kid":        ("Playwrite US Trad",       "PlaywriteUSTrad.ttf"),
+    "kid-modern": ("Playwrite US Modern",     "PlaywriteUSModern.ttf"),
+    "kid-uk":     ("Playwrite GB J",          "PlaywriteGBJ.ttf"),
+    "kid-simple": ("Edu NSW ACT Cursive",     "EduNSWACTCursive.ttf"),
+    "kid-print":  ("Edu NSW ACT Foundation",  "EduNSWACTFoundation.ttf"),
+}
+
 FONT_PRESETS: dict[str, list[tuple[str, int]]] = {
+    # school cursive for children - simple letterforms, proper joins
+    "kid":          [(_bundled("PlaywriteUSTrad.ttf"), 0)],
+    "kid-modern":   [(_bundled("PlaywriteUSModern.ttf"), 0)],
+    "kid-uk":       [(_bundled("PlaywriteGBJ.ttf"), 0)],
+    "kid-simple":   [(_bundled("EduNSWACTCursive.ttf"), 0)],
+    "kid-print":    [(_bundled("EduNSWACTFoundation.ttf"), 0)],
     # flowing joined-up scripts
     "cursive":      [(f"{_SUP}/SnellRoundhand.ttc", 0),
                      (f"{_LIN}/dejavu/DejaVuSerif-Italic.ttf", 0)],
@@ -55,7 +83,7 @@ FONT_PRESETS: dict[str, list[tuple[str, int]]] = {
                      (f"{_LIN}/dejavu/DejaVuSans.ttf", 0)],
 }
 
-DEFAULT_FONT = "script"
+DEFAULT_FONT = "kid"
 
 PAGE_SIZES = {
     "a4":     (595.2756, 841.8898),
@@ -219,7 +247,9 @@ class ScriptFont:
         self._glyphset = self.tt.getGlyphSet()
         self._bounds_cache: dict[str, tuple | None] = {}
         self._gid_cache: dict[str, int] = {}
-        self._enc_cache: dict[str, list[int]] = {}
+        self._shape_cache: dict[str, list[tuple[int, float]]] = {}
+        self.lang = ""
+        self.synthetic_italic = 0.0
         self.used: set[int] = set()
         self.gid_to_char: dict[int, str] = {}
         self.missing: set[str] = set()
@@ -229,6 +259,23 @@ class ScriptFont:
         self.ps_name = re.sub(r"[^A-Za-z0-9-]", "", ps or "PracticeFont") or "PracticeFont"
         self.family = (names.getDebugName(4) or names.getDebugName(1)
                        or os.path.basename(path))
+
+        # Cursive faces such as Playwrite swap in initial/medial/final forms and
+        # separate connector glyphs via GSUB; without shaping the joins are wrong.
+        feats = set()
+        if "GSUB" in self.tt and self.tt["GSUB"].table.FeatureList:
+            feats = {r.FeatureTag for r in self.tt["GSUB"].table.FeatureList.FeatureRecord}
+        self.needs_shaping = bool(feats & {"calt", "clig", "liga", "rclt"})
+
+        self.hb = None
+        if hb is not None:
+            try:
+                face = hb.Face(hb.Blob.from_file_path(path), index)
+                self.hb = hb.Font(face)
+                self.hb.scale = (self.upem, self.upem)
+            except Exception:
+                self.hb = None
+        self.shaping = self.hb is not None
 
     # -- measuring ---------------------------------------------------------
 
@@ -295,26 +342,19 @@ class ScriptFont:
             self._gid_cache[name] = self.tt.getGlyphID(name)
         return self._gid_cache[name]
 
-    def encode(self, text: str) -> list[int]:
-        """Map text to glyph ids, substituting characters the font lacks."""
-        if text in self._enc_cache:
-            return self._enc_cache[text]
-        gids: list[int] = []
+    def prepare(self, text: str) -> str:
+        """Swap out characters this face has no glyph for."""
+        out = []
         for ch in text:
-            for cand, clean in self._candidates(ch):
-                g = self.gid(cand)
-                if g is None:
-                    continue
-                gids.append(g)
-                self.used.add(g)
-                self.gid_to_char.setdefault(g, cand)
-                if not clean:
-                    self.missing.add(ch)
-                break
+            for cand, faithful in self._candidates(ch):
+                if ord(cand) in self.cmap:
+                    out.append(cand)
+                    if not faithful:
+                        self.missing.add(ch)
+                    break
             else:
                 self.missing.add(ch)
-        self._enc_cache[text] = gids
-        return gids
+        return "".join(out)
 
     def _candidates(self, ch: str):
         """(candidate, is_faithful) in order of preference."""
@@ -326,6 +366,55 @@ class ScriptFont:
                 yield c, False                  # accent lost
         yield "?", False
 
+    def shape(self, text: str) -> list[tuple[int, float]]:
+        """[(glyph id, advance in font units)] - joined up where the face asks."""
+        if text in self._shape_cache:
+            return self._shape_cache[text]
+        clean = self.prepare(text)
+
+        if self.hb is not None:
+            buf = hb.Buffer()
+            buf.add_str(clean)
+            buf.guess_segment_properties()
+            buf.direction = "ltr"
+            if self.lang:
+                buf.language = self.lang
+            hb.shape(self.hb, buf)
+            infos = list(buf.glyph_infos)
+            run = [(i.codepoint, float(p.x_advance))
+                   for i, p in zip(infos, buf.glyph_positions)]
+            self._map_clusters(clean, infos)
+        else:
+            run = []
+            for ch in clean:
+                g = self.gid(ch)
+                if g is not None:
+                    run.append((g, self.advance(g)))
+                    self.gid_to_char.setdefault(g, ch)
+
+        for g, _ in run:
+            self.used.add(g)
+        self._shape_cache[text] = run
+        return run
+
+    def _map_clusters(self, clean: str, infos) -> None:
+        """Record glyph -> source text so the PDF stays searchable.
+
+        HarfBuzz groups the glyphs it produced for one input character under a
+        shared cluster number, letter first. The letter carries the character;
+        the connector strokes that follow it carry nothing.
+        """
+        for k, info in enumerate(infos):
+            if k and infos[k - 1].cluster == info.cluster:
+                self.gid_to_char.setdefault(info.codepoint, "")
+                continue
+            end = len(clean)
+            for nxt in infos[k + 1:]:
+                if nxt.cluster != info.cluster:
+                    end = nxt.cluster
+                    break
+            self.gid_to_char.setdefault(info.codepoint, clean[info.cluster:end])
+
     def advance(self, gid: int) -> float:
         try:
             return self._hmtx[self._order[gid]][0]
@@ -333,12 +422,25 @@ class ScriptFont:
             return self.upem * 0.5
 
     def width(self, text: str, size: float, tracking: float = 0.0) -> float:
-        gids = self.encode(text)
-        w = sum(self.advance(g) for g in gids) * size / self.upem
-        return w + tracking * max(len(gids) - 1, 0)
+        run = self.shape(text)
+        w = sum(a for _, a in run) * size / self.upem
+        return w + tracking * max(len(run) - 1, 0)
 
     def show(self, text: str) -> str:
-        return "".join(f"{g:04X}" for g in self.encode(text))
+        """A PDF TJ array; shaped advances become inline kerning adjustments."""
+        run = self.shape(text)
+        parts: list[str] = []
+        buf: list[str] = []
+        for g, adv in run:
+            buf.append(f"{g:04X}")
+            delta = self.advance(g) - adv       # >0 means pull the next glyph left
+            if abs(delta) > 0.5:
+                parts.append(f"<{''.join(buf)}>")
+                buf = []
+                parts.append(num(delta * 1000.0 / self.upem))
+        if buf:
+            parts.append(f"<{''.join(buf)}>")
+        return "[" + " ".join(parts) + "]" if parts else ""
 
     # -- embedding ---------------------------------------------------------
 
@@ -379,7 +481,7 @@ class ScriptFont:
         return "[" + " ".join(parts) + "]"
 
     def _to_unicode(self) -> bytes:
-        pairs = [(g, self.gid_to_char[g]) for g in sorted(self.used) if g in self.gid_to_char]
+        pairs = [(g, self.gid_to_char.get(g, "")) for g in sorted(self.used)]
         head = (
             "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
             "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
@@ -404,7 +506,7 @@ class ScriptFont:
         head, hhea, os2 = self.tt["head"], self.tt["hhea"], self.tt.get("OS/2")
         s = 1000.0 / self.upem
         bbox = " ".join(num(v * s) for v in (head.xMin, head.yMin, head.xMax, head.yMax))
-        italic = self.tt["post"].italicAngle
+        italic = self.tt["post"].italicAngle - self.synthetic_italic
         cap = getattr(os2, "sCapHeight", 0) if os2 else 0
         cap = cap if cap and cap > 0 else self.asc_height
         flags = 4 | (64 if italic else 0)
@@ -513,14 +615,19 @@ class Canvas:
             f"{num(x)} {num(y)} Td {pdf_string(text).decode('latin-1')} Tj ET"
         )
 
-    def script(self, hexgids, x, y, size, rgb, tracking=0.0):
-        if not hexgids:
+    def script(self, tj, x, y, size, rgb, tracking=0.0, slant=0.0):
+        if not tj:
             return
         r, g, b = rgb
         tc = f"{num(tracking)} Tc " if tracking else ""
+        if slant:
+            # shear about the baseline, so the feet stay put and the tops lean
+            skew = math.tan(math.radians(slant))
+            place = f"1 0 {num(skew)} 1 {num(x)} {num(y)} Tm"
+        else:
+            place = f"{num(x)} {num(y)} Td"
         self.ops.append(
-            f"BT /F1 {num(size)} Tf {num(r)} {num(g)} {num(b)} rg {tc}"
-            f"{num(x)} {num(y)} Td <{hexgids}> Tj ET"
+            f"BT /F1 {num(size)} Tf {num(r)} {num(g)} {num(b)} rg {tc}{place} {tj} TJ ET"
         )
 
     def data(self) -> bytes:
@@ -712,8 +819,9 @@ def build_pdf(lines: list[str], font: ScriptFont, sheet: Sheet, opts) -> bytes:
             if not line:
                 continue
             r = sheet.row(i)
-            c.script(font.show(line), sheet.left + opts.text_indent, r["base"] + opts.baseline_shift,
-                     size, ink, opts.tracking)
+            c.script(font.show(line), sheet.left + opts.text_indent,
+                     r["base"] + opts.baseline_shift, size, ink, opts.tracking,
+                     opts.italic)
 
         # ---- footer ----
         if sheet.footer_y:
@@ -748,11 +856,66 @@ def build_pdf(lines: list[str], font: ScriptFont, sheet: Sheet, opts) -> bytes:
 # --------------------------------------------------------------------------
 
 
+GF_CSS = "https://fonts.googleapis.com/css2?family={}:wght@400"
+GF_NOTE = """These faces are downloaded from Google Fonts by
+`handwriting_practice.py --fetch-fonts`. Every one of them is published under
+the SIL Open Font License 1.1, which allows redistribution and embedding.
+
+  Playwrite (US Trad, US Modern, GB J)      - TypeTogether, designed for
+      teaching handwriting; each country's variant follows that country's
+      school model.
+  Edu NSW ACT Cursive / Foundation          - Australian Type Foundry, the
+      NSW/ACT school model.
+
+Full licences: https://fonts.google.com/  (each family's "License" tab)
+"""
+
+
+def fetch_fonts() -> int:
+    """Download the school-handwriting faces into ./fonts."""
+    import urllib.request
+
+    os.makedirs(FONT_DIR, exist_ok=True)
+    ua = {"User-Agent": "Mozilla/5.0"}
+    failed = 0
+    for preset, (family, filename) in GOOGLE_FONTS.items():
+        dest = os.path.join(FONT_DIR, filename)
+        if os.path.exists(dest):
+            print(f"  have  {preset:12s} {filename}")
+            continue
+        try:
+            css_url = GF_CSS.format(family.replace(" ", "+"))
+            css = urllib.request.urlopen(
+                urllib.request.Request(css_url, headers=ua), timeout=30).read().decode()
+            m = re.search(r"url\((https://[^)]+)\)", css)
+            if not m:
+                raise RuntimeError("no font url in the stylesheet")
+            data = urllib.request.urlopen(
+                urllib.request.Request(m.group(1), headers=ua), timeout=60).read()
+            with open(dest, "wb") as fh:
+                fh.write(data)
+            print(f"  got   {preset:12s} {filename}  ({len(data) / 1024:.0f} KB)")
+        except Exception as exc:
+            failed += 1
+            print(f"  FAIL  {preset:12s} {family}: {exc}", file=sys.stderr)
+
+    with open(os.path.join(FONT_DIR, "README.md"), "w") as fh:
+        fh.write("# Bundled handwriting fonts\n\n" + GF_NOTE)
+    if failed:
+        print(f"\n{failed} font(s) could not be downloaded.", file=sys.stderr)
+        return 1
+    print("\nReady. Try:  ./handwriting_practice.py --font kid \"Hello world\"")
+    return 0
+
+
 def resolve_font(spec: str, index: int) -> tuple[str, int]:
     if spec in FONT_PRESETS:
         for path, idx in FONT_PRESETS[spec]:
             if os.path.exists(path):
                 return path, (index if index else idx)
+        if spec in GOOGLE_FONTS:
+            sys.exit(f"The '{spec}' font has not been downloaded yet.\n"
+                     f"Run:  {sys.argv[0]} --fetch-fonts")
         sys.exit(f"None of the files for preset '{spec}' exist on this machine.\n"
                  "Try --list-fonts, or pass a path to a .ttf/.otf/.ttc file.")
     if os.path.exists(spec):
@@ -760,12 +923,37 @@ def resolve_font(spec: str, index: int) -> tuple[str, int]:
     sys.exit(f"Unknown font preset or missing file: {spec!r}  (try --list-fonts)")
 
 
+FONT_BLURB = {
+    "kid":          "joined school cursive, US traditional  <- good first choice",
+    "kid-modern":   "joined school cursive, simpler letterforms",
+    "kid-uk":       "joined school cursive, UK model",
+    "kid-simple":   "joined cursive, very plain and light",
+    "kid-print":    "unjoined pre-cursive - letter shapes before joining",
+    "cursive":      "Snell Roundhand - elegant, ornate capitals",
+    "cursive-bold": "Snell Roundhand, heavier strokes",
+    "chancery":     "slanted calligraphic",
+    "script":       "ornate script",
+    "print":        "Bradley Hand - unjoined handwriting",
+    "note":         "casual print",
+    "chalk":        "round, very legible print",
+    "comic":        "round print",
+    "sans":         "plain reference face",
+}
+
+
 def list_fonts() -> None:
-    print("Font presets (✓ = available here):\n")
+    need_fetch = False
+    print("Font presets (\u2713 = ready to use):\n")
     for name, cands in FONT_PRESETS.items():
-        hit = next((p for p, _ in cands if os.path.exists(p)), None)
-        mark = "✓" if hit else "✗"
-        print(f"  {mark} {name:14s} {hit or cands[0][0]}")
+        hit = next((path for path, _ in cands if os.path.exists(path)), None)
+        need_fetch = need_fetch or (hit is None and name in GOOGLE_FONTS)
+        mark = "\u2713" if hit else "\u2717"
+        print(f"  {mark} {name:13s} {FONT_BLURB.get(name, '')}")
+    if need_fetch:
+        print(f"\nSome need downloading once:  {sys.argv[0]} --fetch-fonts")
+    if hb is None:
+        print("\nNote: uharfbuzz is not installed, so joined cursive faces cannot\n"
+              "      connect their letters properly.  pip install uharfbuzz")
     print("\nYou can also pass any .ttf/.otf/.ttc path to --font "
           "(use --font-index for .ttc collections).")
 
@@ -821,9 +1009,16 @@ def parse_args(argv: list[str] | None = None):
                    help="how far ascenders/descenders may pass their rule (default: 1.25)")
     g.add_argument("--tracking", type=float, default=0.0,
                    help="extra letter spacing in points")
+    g.add_argument("--italic", nargs="?", type=float, const=12.0, default=0.0,
+                   metavar="DEGREES",
+                   help="slant the model text; bare --italic means 12 degrees")
     g.add_argument("--ink", type=parse_rgb, default=(0.3, 0.3, 0.3),
                    help="model text colour: grey level, r,g,b or #rrggbb (default: 0.3)")
+    g.add_argument("--lang", default="",
+                   help='language tag for locale-aware letterforms, e.g. "nl"')
     g.add_argument("--list-fonts", action="store_true", help="show the font presets and exit")
+    g.add_argument("--fetch-fonts", action="store_true",
+                   help="download the school-handwriting fonts into ./fonts and exit")
 
     g = p.add_argument_group("ruling")
     g.add_argument("--rule-asc", type=parse_rgb, default=(0.8, 0.1, 0.1),
@@ -838,8 +1033,9 @@ def parse_args(argv: list[str] | None = None):
                    help="spacing of the slant guides (default: 22.5)")
     g.add_argument("--guide-color", type=parse_rgb, default=(0.92, 0.94, 0.97),
                    help="slant guide colour")
-    g.add_argument("--slant", type=float, default=0.0,
-                   help="slant guide angle in degrees (default: 0 = upright)")
+    g.add_argument("--slant", type=float, default=None,
+                   help="slant guide angle in degrees "
+                        "(default: follow --italic, else upright)")
     g.add_argument("--no-divider", dest="divider", action="store_false",
                    help="drop the dashed line between the two halves")
     g.add_argument("--divider-label", default="",
@@ -872,6 +1068,9 @@ def parse_args(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> int:
     opts = parse_args(argv)
 
+    if opts.fetch_fonts:
+        return fetch_fonts()
+
     if opts.list_fonts:
         list_fonts()
         return 0
@@ -886,10 +1085,21 @@ def main(argv: list[str] | None = None) -> int:
 
     path, index = resolve_font(opts.font, opts.font_index)
     font = ScriptFont(path, index)
+    font.lang = opts.lang
+    if font.needs_shaping and not font.shaping:
+        print(f"  warning: {font.family} joins its letters through OpenType "
+              "shaping.\n           Install uharfbuzz for correct joins:  "
+              "pip install uharfbuzz", file=sys.stderr)
     sheet = Sheet(opts)
 
+    font.synthetic_italic = opts.italic
+    if opts.slant is None:                  # guides lean with the writing
+        opts.slant = opts.italic
+
     opts.computed_size = choose_size(font, sheet.unit, opts)
-    max_w = (sheet.right - sheet.left) - opts.text_indent
+    # a sheared line reaches further right at the top than its advances suggest
+    overhang = math.tan(math.radians(opts.italic)) * 2 * sheet.unit
+    max_w = (sheet.right - sheet.left) - opts.text_indent - overhang
     lines = flow(font, text, opts.computed_size, max_w, opts)
 
     data = build_pdf(lines, font, sheet, opts)

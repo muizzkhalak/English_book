@@ -1,0 +1,1 @@
+python handwriting_alternating.py -f input.txt --font kid-simple --italic -o output.pdf
